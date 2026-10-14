@@ -1,0 +1,584 @@
+Dưới đây là bản hướng dẫn thực hành từng bước kèm **mã nguồn hoàn chỉnh (Full Code)** của từng file bằng Python. Bạn chỉ cần tạo thư mục, copy từng file vào đúng vị trí là chạy được ngay.
+
+---
+
+## Bước 1: Tạo thư mục và cài đặt thư viện
+
+Mở Terminal (hoặc PowerShell / CMD) tại thư mục bạn muốn lưu code và chạy:
+
+```bash
+mkdir job-hunter-bot
+cd job-hunter-bot
+mkdir data chrome_profile src
+
+# Cài đặt các thư viện cần thiết
+pip install playwright httpx beautifulsoup4 google-genai pydantic python-dotenv
+
+```
+
+---
+
+## Bước 2: Cấu hình thông số (`src/config.py`)
+
+Tạo file `src/config.py` để quản lý toàn bộ từ khóa, link Group Facebook và API Key ở một nơi duy nhất:
+
+```python
+# src/config.py
+import os
+
+# 1. API Keys (Bạn có thể điền trực tiếp vào đây khi chạy trên máy cá nhân)
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "DIEN_GEMINI_API_KEY_CUA_BAN_VAO_DAY")
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "DIEN_TELEGRAM_TOKEN_VAO_DAY")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "DIEN_CHAT_ID_CUA_BAN_VAO_DAY")
+GOOGLE_SHEET_WEBHOOK = os.getenv("GOOGLE_SHEET_WEBHOOK", "") # Để trống nếu chưa dùng
+
+# 2. Nguồn cào mục tiêu
+LINKEDIN_KEYWORDS = [
+    "Unity Developer",
+    "Game Developer",
+    "C# Developer",
+    "Node.js Developer",
+    "Java Backend"
+]
+LINKEDIN_LOCATION = "Hanoi, Vietnam"
+
+# Lưu ý: Luôn giữ đuôi ?sorting_setting=CHRONOLOGICAL để ép Facebook xếp bài mới nhất lên đầu
+FB_GROUP_URLS = [
+    "https://www.facebook.com/groups/congdongunityvietnam/?sorting_setting=CHRONOLOGICAL",
+    "https://www.facebook.com/groups/gamedevvietnam/?sorting_setting=CHRONOLOGICAL",
+]
+
+# 3. Bộ từ khóa lọc thô (Chạy trong 0.1ms trước khi gọi AI)
+NEGATIVE_KEYWORDS = [
+    "tìm việc", "xin thực tập", "em đang tìm", "nhận làm đồ án", 
+    "khóa học", "cam kết đầu ra", "học viên", "việc nhẹ lương cao",
+    "tuyển cộng tác viên bán hàng", "tuyển mẫu ảnh"
+]
+
+POSITIVE_KEYWORDS = [
+    "tuyển", "hiring", "jd", "cần tìm", "developer", "lập trình",
+    "unity", "game", "c#", "c++", "java", "node", "backend", "fullstack",
+    "intern", "fresher", "junior", "thực tập"
+]
+
+# 4. Ngưỡng điểm chất lượng (0 - 100)
+MIN_SCORE_NOTIFY = 70  # Từ 70 điểm trở lên mới bắn về Telegram
+
+```
+
+---
+
+## Bước 3: Cơ sở dữ liệu SQLite chống trùng lặp (`src/db.py`)
+
+File này tự động tạo file `data/jobs.db`, kiểm tra xem một bài viết đã từng xuất hiện chưa, và đếm số lần HR đăng lại bài đó:
+
+```python
+# src/db.py
+import sqlite3
+from pathlib import Path
+
+DB_PATH = Path(__file__).resolve().parent.parent / "data" / "jobs.db"
+
+def get_conn():
+    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    return sqlite3.connect(DB_PATH)
+
+def init_db():
+    with get_conn() as conn:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS jobs (
+                raw_id TEXT PRIMARY KEY,
+                content_hash TEXT,
+                source TEXT,
+                company TEXT,
+                role_title TEXT,
+                seniority_level TEXT,
+                tech_stack TEXT,
+                salary_info TEXT,
+                ai_score INTEGER DEFAULT 0,
+                url TEXT,
+                repost_count INTEGER DEFAULT 1,
+                status TEXT DEFAULT 'new',
+                first_seen_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                last_seen_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_content_hash ON jobs(content_hash)")
+
+def is_duplicate_or_repost(raw_id: str, content_hash: str) -> bool:
+    """Trả về True nếu bài đã từng quét (theo ID hoặc theo nội dung giống hệt)."""
+    with get_conn() as conn:
+        # 1. Kiểm tra trùng đúng ID bài viết
+        row = conn.execute("SELECT 1 FROM jobs WHERE raw_id = ?", (raw_id,)).fetchone()
+        if row:
+            return True
+
+        # 2. Kiểm tra trùng nội dung (HR đăng cùng 1 bài ở nhiều nơi hoặc đăng lại)
+        hash_row = conn.execute(
+            "SELECT raw_id FROM jobs WHERE content_hash = ?", (content_hash,)
+        ).fetchone()
+        if hash_row:
+            conn.execute("""
+                UPDATE jobs 
+                SET repost_count = repost_count + 1, last_seen_at = CURRENT_TIMESTAMP 
+                WHERE content_hash = ?
+            """, (content_hash,))
+            return True
+
+    return False
+
+def save_job(job_data: dict):
+    with get_conn() as conn:
+        conn.execute("""
+            INSERT OR REPLACE INTO jobs 
+            (raw_id, content_hash, source, company, role_title, seniority_level, 
+             tech_stack, salary_info, ai_score, url, status)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            job_data["raw_id"],
+            job_data["content_hash"],
+            job_data["source"],
+            job_data.get("company", ""),
+            job_data.get("role_title", ""),
+            job_data.get("seniority_level", ""),
+            job_data.get("tech_stack", ""),
+            job_data.get("salary_info", ""),
+            job_data.get("ai_score", 0),
+            job_data["url"],
+            job_data["status"]
+        ))
+
+```
+
+---
+
+## Bước 4: Bộ lọc Thô & Băm nội dung (`src/pre_filter.py`)
+
+Xử lý xóa số điện thoại/ký tự rác để tạo mã băm `content_hash` chuẩn xác, đồng thời chặn ngay các bài không liên quan trước khi gọi AI:
+
+```python
+# src/pre_filter.py
+import re
+import hashlib
+from config import NEGATIVE_KEYWORDS, POSITIVE_KEYWORDS
+
+def compute_content_hash(text: str) -> str:
+    """Chuẩn hóa văn bản (bỏ số, ký tự đặc biệt, khoảng trắng) rồi băm MD5."""
+    clean = text.lower()
+    clean = re.sub(r'\d+', '', clean)            # Xóa ngày tháng, số điện thoại để bắt bài đăng lại
+    clean = re.sub(r'[^\w\s]', '', clean)        # Xóa dấu câu, icon
+    clean = re.sub(r'\s+', ' ', clean).strip()   # Gộp khoảng trắng
+    # Lấy tối đa 300 ký tự cốt lõi ở đầu bài để băm
+    core_sample = clean[:300]
+    return hashlib.md5(core_sample.encode("utf-8")).hexdigest()
+
+def passes_keyword_filter(text: str) -> tuple[bool, str]:
+    """Kiểm tra xem văn bản có vượt qua bộ lọc từ khóa không."""
+    if not text or len(text.strip()) < 60:
+        return False, "Bài quá ngắn (< 60 ký tự)"
+
+    lower_text = text.lower()
+
+    # 1. Dính từ khóa cấm -> Loại ngay
+    for neg in NEGATIVE_KEYWORDS:
+        if neg in lower_text:
+            return False, f"Chứa từ khóa loại trừ: '{neg}'"
+
+    # 2. Phải chứa ít nhất 1 từ khóa mục tiêu
+    if not any(pos in lower_text for pos in POSITIVE_KEYWORDS):
+        return False, "Không chứa từ khóa tuyển dụng/công nghệ mục tiêu"
+
+    return True, "OK"
+
+```
+
+---
+
+## Bước 5: Trình cào LinkedIn không cần trình duyệt (`src/linkedin_api.py`)
+
+Gọi thẳng vào API ẩn của LinkedIn để lấy danh sách việc làm mới đăng trong 24 giờ qua:
+
+```python
+# src/linkedin_api.py
+import time
+import random
+import httpx
+from bs4 import BeautifulSoup
+from config import LINKEDIN_KEYWORDS, LINKEDIN_LOCATION
+from db import is_duplicate_or_repost
+
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
+}
+
+def fetch_linkedin_jobs() -> list[dict]:
+    collected_jobs = []
+    seen_in_session = set()
+
+    with httpx.Client(headers=HEADERS, timeout=15.0) as client:
+        for kw in LINKEDIN_KEYWORDS:
+            print(f"[LinkedIn] Đang quét từ khóa: {kw}...")
+            search_url = (
+                "https://www.linkedin.com/jobs-guest/jobs/api/seeMoreJobPostings/search"
+                f"?keywords={httpx.URL(kw)}&location={httpx.URL(LINKEDIN_LOCATION)}"
+                "&f_TPR=r86400&sortBy=DD&start=0"
+            )
+            try:
+                resp = client.get(search_url)
+                if resp.status_code != 200:
+                    continue
+
+                soup = BeautifulSoup(resp.text, "html.parser")
+                cards = soup.find_all("div", class_="base-card")
+
+                for card in cards:
+                    urn = card.get("data-entity-urn", "")
+                    if not urn or ":" not in urn:
+                        continue
+                    job_id = urn.split(":")[-1]
+                    raw_id = f"li_{job_id}"
+
+                    # Bỏ qua ngay nếu đã quét ở từ khóa trước hoặc đã có trong DB
+                    if raw_id in seen_in_session or is_duplicate_or_repost(raw_id, ""):
+                        continue
+                    seen_in_session.add(raw_id)
+
+                    # Gọi API lấy nội dung chi tiết JD
+                    time.sleep(random.uniform(1.2, 2.5))
+                    detail_url = f"https://www.linkedin.com/jobs-guest/jobs/api/jobPosting/{job_id}"
+                    detail_resp = client.get(detail_url)
+                    if detail_resp.status_code != 200:
+                        continue
+
+                    detail_soup = BeautifulSoup(detail_resp.text, "html.parser")
+                    title_el = detail_soup.find("h2", class_="top-card-layout__title")
+                    comp_el = detail_soup.find("a", class_="topcard__org-name-link")
+                    desc_el = detail_soup.find("div", class_="show-more-less-html__markup")
+
+                    title = title_el.get_text(strip=True) if title_el else ""
+                    company = comp_el.get_text(strip=True) if comp_el else "Ẩn danh"
+                    desc = desc_el.get_text(separator="\n", strip=True) if desc_el else ""
+
+                    full_text = f"Công ty: {company}\nVị trí: {title}\nMô tả:\n{desc}"
+                    collected_jobs.append({
+                        "raw_id": raw_id,
+                        "source": "linkedin",
+                        "raw_text": full_text,
+                        "url": f"https://www.linkedin.com/jobs/view/{job_id}/"
+                    })
+            except Exception as e:
+                print(f"[LinkedIn] Lỗi khi quét '{kw}': {e}")
+
+    return collected_jobs
+
+```
+
+---
+
+## Bước 6: Trình bắt gói tin Facebook Group qua Chrome thật (`src/fb_cdp_listener.py`)
+
+### 6.1. Tạo file bật Chrome Debug (`start_chrome_debug.bat`)
+
+Tạo file `start_chrome_debug.bat` ở thư mục gốc `job-hunter-bot/`:
+
+```bat
+@echo off
+echo Dang mo Chrome o che do Remote Debugging (Port 9222)...
+"C:\Program Files\Google\Chrome\Application\chrome.exe" --remote-debugging-port=9222 --user-data-dir="%~dp0chrome_profile"
+
+```
+
+> **Cách dùng:** Nhấp đúp vào `start_chrome_debug.bat`, một cửa sổ Chrome riêng sẽ hiện lên. Bạn **đăng nhập sẵn nick Facebook phụ** trên cửa sổ này (chỉ cần làm 1 lần duy nhất, các lần sau mở lên là đã đăng nhập sẵn).
+
+### 6.2. Viết code lắng nghe gói tin GraphQL (`src/fb_cdp_listener.py`)
+
+Khi Playwright cuộn trang, Facebook trả về các cục dữ liệu qua `/api/graphql/`. Hàm đệ quy dưới đây sẽ tự động móc toàn bộ các bài viết nằm bên trong gói JSON đó mà không sợ Facebook đổi class HTML:
+
+```python
+# src/fb_cdp_listener.py
+import json
+import time
+import random
+from playwright.sync_api import sync_playwright
+from config import FB_GROUP_URLS
+
+def extract_posts_from_json(obj, found_posts: dict):
+    """Đệ quy tìm các node bài viết (Story) bên trong JSON GraphQL của Facebook."""
+    if isinstance(obj, dict):
+        # Một bài đăng trong Group thường có 'post_id' và nội dung nằm ở 'message.text'
+        post_id = obj.get("post_id")
+        message = obj.get("message")
+        if post_id and isinstance(message, dict) and message.get("text"):
+            text = message["text"]
+            url = obj.get("url") or f"https://www.facebook.com/{post_id}"
+            if len(text) > 60:
+                found_posts[f"fb_{post_id}"] = {
+                    "raw_id": f"fb_{post_id}",
+                    "source": "facebook_group",
+                    "raw_text": text,
+                    "url": url
+                }
+        for val in obj.values():
+            extract_posts_from_json(val, found_posts)
+    elif isinstance(obj, list):
+        for item in obj:
+            extract_posts_from_json(item, found_posts)
+
+def fetch_facebook_group_jobs() -> list[dict]:
+    found_posts = {}
+
+    def handle_response(response):
+        if "/api/graphql/" in response.url and response.status == 200:
+            try:
+                raw_body = response.text()
+                # Facebook thường trả về nhiều dòng JSON nối nhau (NDJSON)
+                for line in raw_body.splitlines():
+                    line = line.strip()
+                    if line.startswith("{"):
+                        data = json.loads(line)
+                        extract_posts_from_json(data, found_posts)
+            except Exception:
+                pass
+
+    try:
+        with sync_playwright() as p:
+            print("[Facebook] Đang kết nối vào Chrome thật qua cổng 9222...")
+            browser = p.chromium.connect_over_cdp("http://127.0.0.1:9222")
+            context = browser.contexts[0]
+            page = context.new_page()
+            page.on("response", handle_response)
+
+            for group_url in FB_GROUP_URLS:
+                print(f"[Facebook] Đang mở Group: {group_url}")
+                page.goto(group_url, wait_until="domcontentloaded", timeout=45000)
+                time.sleep(random.uniform(4.0, 6.0))
+
+                # Cuộn trang 5 lần với nhịp nghỉ tự nhiên như người thật
+                for step in range(5):
+                    page.mouse.wheel(0, random.randint(700, 1100))
+                    print(f"  -> Đã cuộn lần {step + 1}/5, đang lắng nghe gói tin GraphQL...")
+                    time.sleep(random.uniform(3.5, 7.5))
+
+                # Nghỉ giữa các Group
+                time.sleep(random.uniform(8.0, 12.0))
+
+            page.close()
+    except Exception as e:
+        print(f"[Facebook] Không kết nối được cổng 9222 (Hãy bật start_chrome_debug.bat trước): {e}")
+
+    print(f"[Facebook] Thu hoạch được {len(found_posts)} bài viết từ gói tin ngầm.")
+    return list(found_posts.values())
+
+```
+
+---
+
+## Bước 7: Bộ não chấm điểm bằng Gemini API (`src/ai_scorer.py`)
+
+Sử dụng SDK `google-genai` mới nhất kèm `Pydantic Schema` để ép `gemini-2.5-flash` trả về đúng định dạng JSON và chấm điểm theo thang 100:
+
+```python
+# src/ai_scorer.py
+from pydantic import BaseModel, Field
+from google import genai
+from google.genai import types
+from config import GEMINI_API_KEY
+
+# Định nghĩa khung dữ liệu đầu ra cố định
+class JobEvaluation(BaseModel):
+    is_valid_job: bool = Field(description="True nếu đây là bài đăng tuyển dụng thực sự (không phải ứng viên tìm việc hay bán khóa học)")
+    company_name: str = Field(description="Tên công ty/studio hoặc 'Ẩn danh'")
+    role_title: str = Field(description="Tên vị trí tuyển dụng")
+    seniority_level: str = Field(description="Cấp bậc: Intern / Fresher / Junior / Middle / Senior")
+    tech_stack: list[str] = Field(description="Danh sách ngôn ngữ, framework, công cụ yêu cầu")
+    salary_info: str = Field(description="Mức lương cụ thể hoặc 'Thỏa thuận'")
+    work_location: str = Field(description="Địa điểm làm việc")
+    contact_method: str = Field(description="Email hoặc cách thức ứng tuyển")
+    transparency_score: int = Field(description="Điểm minh bạch từ 0 đến 35 (có tên cty +15, có lương rõ +10, có địa chỉ rõ +10)")
+    credibility_score: int = Field(description="Điểm uy tín người đăng từ 0 đến 25 (Tech lead/HR có email tên miền cty +25, cò mồi/inbox kín +5)")
+    profile_match_score: int = Field(description="Điểm khớp kỹ năng từ 0 đến 40 (Khớp Unity/C#/Game/C++/Java/Node.js và trình độ Intern/Fresher/Junior)")
+    total_score: int = Field(description="Tổng 3 đầu điểm trên (0 - 100)")
+    one_line_summary: str = Field(description="Tóm tắt ngắn gọn 1 câu lý do nên hay không nên nộp")
+
+SYSTEM_PROMPT = """
+Bạn là chuyên gia thẩm định tin tuyển dụng CNTT. Hãy phân tích bài viết và chấm điểm khắt khe trên thang 100 cho ứng viên có hồ sơ:
+- Thế mạnh: Lập trình Game (Unity 2D/3D, C#, C++, SDL, Phaser) và Phát triển phần mềm/Backend (Java Spring Boot, Node.js, C#, SQL).
+- Cấp bậc mục tiêu: Thực tập sinh (Intern), Mới ra trường (Fresher), hoặc Junior (dưới 2 năm kinh nghiệm).
+- Khu vực ưu tiên: Hà Nội hoặc Remote.
+Nếu bài yêu cầu Senior trên 3 năm kinh nghiệm hoặc lệch hẳn sang mảng không liên quan (Sales, Marketing, Kế toán), hãy trừ nặng điểm profile_match_score.
+"""
+
+def evaluate_job_with_ai(raw_text: str) -> dict | None:
+    if not GEMINI_API_KEY or "DIEN_GEMINI" in GEMINI_API_KEY:
+        print("[AI Scorer] Chưa cấu hình GEMINI_API_KEY!")
+        return None
+
+    client = genai.Client(api_key=GEMINI_API_KEY)
+    try:
+        response = client.models.generate_content(
+            model="gemini-2.5-flash",
+            contents=f"Phân tích bài đăng sau:\n\n{raw_text[:4000]}",
+            config=types.GenerateContentConfig(
+                system_instruction=SYSTEM_PROMPT,
+                response_mime_type="application/json",
+                response_schema=JobEvaluation,
+                temperature=0.1,
+            ),
+        )
+        return response.parsed.model_dump()
+    except Exception as e:
+        print(f"[AI Scorer] Lỗi khi gọi Gemini API: {e}")
+        return None
+
+```
+
+---
+
+## Bước 8: Bắn thông báo về Telegram (`src/notifier.py`)
+
+```python
+# src/notifier.py
+import httpx
+from config import TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
+
+def send_telegram_alert(job: dict, ai_result: dict):
+    if not TELEGRAM_BOT_TOKEN or "DIEN_TELEGRAM" in TELEGRAM_BOT_TOKEN:
+        print(f"[Thông báo Console] 🔥 JOB NGON ({ai_result['total_score']}đ): {ai_result['role_title']} - {job['url']}")
+        return
+
+    tech_str = ", ".join(ai_result.get("tech_stack", []))
+    msg = (
+        f"🔥 <b>[{ai_result['total_score']}/100 điểm] {ai_result['role_title']}</b>\n"
+        f"🏢 <b>Công ty:</b> {ai_result['company_name']}\n"
+        f"🎯 <b>Cấp bậc:</b> {ai_result['seniority_level']}\n"
+        f"🛠 <b>Công nghệ:</b> {tech_str}\n"
+        f"💰 <b>Mức lương:</b> {ai_result['salary_info']}\n"
+        f"📍 <b>Địa điểm:</b> {ai_result['work_location']}\n"
+        f"📬 <b>Liên hệ:</b> {ai_result['contact_method']}\n\n"
+        f"💡 <i>{ai_result['one_line_summary']}</i>\n"
+        f"🔗 <a href='{job['url']}'>Xem bài đăng gốc ({job['source']})</a>"
+    )
+
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    try:
+        httpx.post(url, json={
+            "chat_id": TELEGRAM_CHAT_ID,
+            "text": msg,
+            "parse_mode": "HTML",
+            "disable_web_page_preview": True
+        }, timeout=10.0)
+    except Exception as e:
+        print(f"[Notifier] Lỗi gửi Telegram: {e}")
+
+```
+
+---
+
+## Bước 9: File điều phối chính (`src/main.py`)
+
+File này nối tất cả các bước lại với nhau thành một luồng khép kín:
+
+```python
+# src/main.py
+import time
+from config import MIN_SCORE_NOTIFY
+from db import init_db, is_duplicate_or_repost, save_job
+from pre_filter import compute_content_hash, passes_keyword_filter
+from linkedin_api import fetch_linkedin_jobs
+from fb_cdp_listener import fetch_facebook_group_jobs
+from ai_scorer import evaluate_job_with_ai
+from notifier import send_telegram_alert
+
+def run_pipeline():
+    print("=== BẮT ĐẦU CHU KỲ QUÉT VIỆC LÀM ===")
+    init_db()
+
+    # 1. Thu thập dữ liệu thô từ cả LinkedIn và Facebook Group
+    raw_jobs = []
+    raw_jobs.extend(fetch_linkedin_jobs())
+    raw_jobs.extend(fetch_facebook_group_jobs())
+    print(f"\n[Tổng hợp] Thu về {len(raw_jobs)} bài viết thô. Bắt đầu lọc...")
+
+    new_qualified_count = 0
+
+    for job in raw_jobs:
+        raw_id = job["raw_id"]
+        raw_text = job["raw_text"]
+        content_hash = compute_content_hash(raw_text)
+
+        # 2. Kiểm tra trùng lặp trong SQLite (Tốn 0ms, 0 token)
+        if is_duplicate_or_repost(raw_id, content_hash):
+            continue
+
+        # 3. Kiểm tra bộ lọc từ khóa (Negative & Positive Keywords)
+        passed, reason = passes_keyword_filter(raw_text)
+        if not passed:
+            save_job({
+                "raw_id": raw_id,
+                "content_hash": content_hash,
+                "source": job["source"],
+                "url": job["url"],
+                "status": "rejected_keyword"
+            })
+            continue
+
+        # 4. Gọi Gemini chấm điểm chất lượng
+        print(f"[AI] Đang chấm điểm bài mới: {raw_id} ({job['source']})...")
+        ai_res = evaluate_job_with_ai(raw_text)
+        time.sleep(2.0)  # Giãn cách nhẹ tránh chạm Rate Limit của gói Gemini Free
+
+        if not ai_res or not ai_res.get("is_valid_job"):
+            save_job({
+                "raw_id": raw_id,
+                "content_hash": content_hash,
+                "source": job["source"],
+                "url": job["url"],
+                "status": "not_a_job"
+            })
+            continue
+
+        score = ai_res.get("total_score", 0)
+        status = "notified" if score >= MIN_SCORE_NOTIFY else "low_score"
+
+        # 5. Lưu kết quả vào SQLite
+        save_job({
+            "raw_id": raw_id,
+            "content_hash": content_hash,
+            "source": job["source"],
+            "company": ai_res.get("company_name", ""),
+            "role_title": ai_res.get("role_title", ""),
+            "seniority_level": ai_res.get("seniority_level", ""),
+            "tech_stack": ", ".join(ai_res.get("tech_stack", [])),
+            "salary_info": ai_res.get("salary_info", ""),
+            "ai_score": score,
+            "url": job["url"],
+            "status": status
+        })
+
+        # 6. Bắn thông báo nếu điểm đạt chuẩn (>= 70 điểm)
+        if score >= MIN_SCORE_NOTIFY:
+            new_qualified_count += 1
+            send_telegram_alert(job, ai_res)
+
+    print(f"=== HOÀN TẤT! Phát hiện {new_qualified_count} việc làm chất lượng cao mới. ===")
+
+if __name__ == "__main__":
+    run_pipeline()
+
+```
+
+---
+
+## Bước 10: Cách vận hành hàng ngày
+
+1. **Lấy Gemini API Key miễn phí:** Truy cập [Google AI Studio](https://aistudio.google.com/), tạo 1 API Key (Gói miễn phí cho phép 1.500 lượt gọi/ngày với `gemini-2.5-flash` — dư sức chấm điểm cả trăm bài đăng).
+2. **Mở Chrome phụ:** Chạy file `start_chrome_debug.bat` (chỉ cần để cửa sổ Chrome đó thu nhỏ dưới thanh Taskbar).
+3. **Chạy Bot:** Mở Terminal chạy lệnh:
+```bash
+python src/main.py
+
+```
+
+
+
+Khi chạy thử lần đầu tiên, nếu bạn chưa kịp tạo Telegram Bot thì cũng không sao: hàm `send_telegram_alert` trong code trên đã được thiết kế để tự động **in thẳng các công việc đạt trên 70 điểm ra màn hình Console** kèm đường dẫn bài gốc để bạn kiểm tra ngay lập tức.
